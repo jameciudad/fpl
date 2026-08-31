@@ -103,9 +103,23 @@ def load_live(gw):
 
 @st.cache_data(ttl=3600)
 def load_understat():
-    from understatapi import UnderstatClient
-    with UnderstatClient() as understat:
-        data = understat.league(league="EPL").get_player_data(season=UNDERSTAT_SEASON)
+    import re
+    import json
+
+    url = f"https://understat.com/league/EPL/{UNDERSTAT_SEASON}"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    resp = requests.get(url, headers=headers, timeout=15)
+    resp.raise_for_status()
+
+    match = re.search(r"var playersData\s*=\s*JSON\.parse\('(.*?)'\)", resp.text)
+    if not match:
+        raise ValueError("Couldn't find player data on the Understat page (page layout may have changed).")
+
+    # Understat escapes the JSON string for JS (e.g. \xC3\xA9 for accented characters);
+    # this round-trip decodes those escapes back to proper UTF-8 text.
+    raw = match.group(1).encode("utf-8").decode("unicode_escape").encode("latin1").decode("utf-8")
+    data = json.loads(raw)
+
     df = pd.DataFrame(data)
     numeric_cols = [
         "games", "time", "goals", "xG", "assists", "xA", "shots",
@@ -469,12 +483,6 @@ def render_understat():
 
     try:
         df = load_understat()
-    except ImportError:
-        st.error(
-            "This page needs the `understatapi` package. Install it with:\n\n"
-            "`pip install understatapi`\n\nthen rerun the app."
-        )
-        return
     except Exception as e:
         st.error(f"Couldn't load Understat data: {e}")
         return
