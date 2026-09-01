@@ -317,10 +317,11 @@ def render_gw_summary():
     st.subheader("Copy Text")
     copy_sections = {
         "Points": top5_tables["Points"],
-        "Points per Million": top5_tables["Points per Million"],
-        "Points (<5% Owned)": top5_tables["Points (<5% Owned)"],
         "xG": top5_tables["xG"],
         "xA": top5_tables["xA"],
+        "DefCon": top5_tables["Defensive Contribution"],
+        "Points per Million": top5_tables["Points per Million"],
+        "Points (<5% Owned)": top5_tables["Points (<5% Owned)"],
     }
     copy_text = build_copy_text(gw, copy_sections)
     st.code(copy_text, language=None)
