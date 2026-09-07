@@ -334,7 +334,7 @@ def render_player_explorer():
 
     # Latest known price/position/team per player (most recent GW row)
     latest = df.sort_values("GW").groupby("name").last().reset_index()
-    latest = latest[["name", "position", "team", "value"]]
+    latest = latest[["name", "position", "team", "value", "element"]]
     latest["price"] = latest["value"] / 10
 
     # Sidebar filters
@@ -357,9 +357,18 @@ def render_player_explorer():
         "Stat to display per GW", list(STAT_OPTIONS.keys()), index=0, key="player_stat_select"
     )
     stat_col = STAT_OPTIONS[stat_label]
+    is_defcon = stat_col == "defensive_contribution"
+    is_xg = stat_col == "expected_goals"
+    is_xa = stat_col == "expected_assists"
 
+    # "Total Points" is always available as a sort option (independent of the
+    # stat currently being displayed per-GW), plus a generic "Total (selected
+    # stat)" option for sorting by whatever stat is on screen.
+    sort_options = ["Total Points", "Price", "Position", "Team", "Total (selected stat)"]
+    if is_defcon:
+        sort_options.append("Hit Rate")
     sort_by = st.sidebar.selectbox(
-        "Sort players by", ["Price", "Position", "Team", "Total (selected stat)"], key="player_sort_by"
+        "Sort players by", sort_options, key="player_sort_by"
     )
     sort_desc = st.sidebar.checkbox("Descending", value=True, key="player_sort_desc")
 
@@ -381,18 +390,60 @@ def render_player_explorer():
     pivot.columns = [f"GW{int(c)}" for c in pivot.columns]
     pivot = pivot.sort_index(axis=1, key=lambda idx: [int(c[2:]) for c in idx])
 
+    # Use FPL's short "web_name" (e.g. "Gabriel", "António Silva") instead of the
+    # long full name from the CSV, wherever we have a matching player id.
+    bootstrap = load_bootstrap()
+    _, _, player_web_names, _ = build_lookups(bootstrap)
+    name_to_display = dict(zip(
+        filtered_players["name"],
+        filtered_players["element"].map(player_web_names).fillna(filtered_players["name"]),
+    ))
+
     # Merge player meta back in
     result = filtered_players.set_index("name").join(pivot)
+    result = result.rename(index=name_to_display)
     gw_cols = [c for c in result.columns if c.startswith("GW")]
     result["Total"] = result[gw_cols].sum(axis=1)
     result["Avg"] = result[gw_cols].mean(axis=1).round(2)
 
+    # Season-total minutes and total FPL points per player, used for per-90
+    # calcs and the always-available "Total Points" sort — kept off the
+    # display_cols list below so they don't show up as extra table columns.
+    minutes_totals = pivot_source.groupby("name")["minutes"].sum()
+    minutes_totals.index = minutes_totals.index.map(lambda n: name_to_display.get(n, n))
+    result["MinutesTotal"] = minutes_totals
+
+    points_totals = pivot_source.groupby("name")["total_points"].sum()
+    points_totals.index = points_totals.index.map(lambda n: name_to_display.get(n, n))
+    result["TotalPoints"] = points_totals
+
+    # DefCon hit-rate: DEF need 10+, everyone else needs 12+ in a given GW to count as a "hit"
+    if is_defcon:
+        def defcon_threshold(pos):
+            return 10 if pos == "DEF" else 12
+
+        total_gws = len(gw_cols)
+        hit_counts = result.apply(
+            lambda row: sum(1 for c in gw_cols if row[c] >= defcon_threshold(row["position"])),
+            axis=1,
+        )
+        # Keep this numeric (not a "50%" string) so the interactive column-header
+        # sort in st.dataframe orders it correctly — formatting to "%" happens
+        # only at display time via column_config below.
+        result["Hit Rate"] = (hit_counts / total_gws * 100).round().astype(int) if total_gws else 0
+
+    # Keep a full copy (with position/team/price/Avg/MinutesTotal/etc.) before
+    # columns get trimmed for display below — the text generators need this.
+    full_result = result.copy()
+
     # Sorting
     sort_map = {
+        "Total Points": "TotalPoints",
         "Price": "price",
         "Position": "position",
         "Team": "team",
         "Total (selected stat)": "Total",
+        "Hit Rate": "Hit Rate",
     }
     sort_col = sort_map[sort_by]
     if sort_col == "position":
@@ -406,11 +457,177 @@ def render_player_explorer():
     if len(selected_teams) == 1:
         base_cols = ["position", "price"]
 
-    display_cols = base_cols + gw_cols + ["Total", "Avg"]
+    trailing_cols = ["Total", "Avg", "Hit Rate"] if is_defcon else ["Total", "Avg"]
+    display_cols = base_cols + gw_cols + trailing_cols
     result = result[display_cols].rename(columns={"position": "Pos", "team": "Team", "price": "Price"})
 
     st.caption(f"Showing **{stat_label}** per gameweek · {len(result)} players")
-    st.dataframe(result, use_container_width=True, height=700)
+    if is_defcon and len(result) > 0:
+        st.caption(f"Highest Hit Rate currently in this view: **{full_result['Hit Rate'].max()}%**")
+
+    column_config = {"Hit Rate": st.column_config.NumberColumn(format="%d%%")} if is_defcon else None
+    st.dataframe(result, use_container_width=True, height=700, column_config=column_config)
+
+    # --- DefCon hit-rate text generator ---
+    if is_defcon:
+        st.divider()
+        st.subheader("DefCon Hit Rate Text Generator")
+
+        min_pct = st.slider(
+            "Minimum DefCon hit rate (%)", min_value=0, max_value=100, value=50, step=5,
+            key="defcon_hit_rate_min",
+        )
+
+        qualifying = full_result[full_result["Hit Rate"] >= min_pct].sort_values("Avg", ascending=False)
+
+        suffix = "" if min_pct == 100 else "+"
+        lines = [f"*🛡️ Players with a {min_pct}%{suffix} DefCon rate:*", ""]
+        for name, row in qualifying.iterrows():
+            lines.append(f"{name} ({row['position']}): {round(row['Avg'])} per game")
+
+        st.code("\n".join(lines), language=None)
+
+    # --- xG / xA Leaders text generator ---
+    if is_xg or is_xa:
+        stat_short = "xG" if is_xg else "xA"
+        actual_col = "goals_scored" if is_xg else "assists"
+        actual_label = "G" if is_xg else "A"
+
+        st.divider()
+        st.subheader(f"{stat_short} Leaders Text Generator")
+
+        available_gws = sorted(int(c[2:]) for c in gw_cols)
+        gw_min, gw_max = min(available_gws), max(available_gws)
+
+        leader_col_a, leader_col_b = st.columns(2)
+        with leader_col_a:
+            leader_position = st.selectbox(
+                "Position", ["All"] + POSITION_ORDER, key=f"{stat_col}_leader_position"
+            )
+        with leader_col_b:
+            leader_price_range = st.slider(
+                "Price range (£m)", price_min, price_max, (price_min, price_max), step=0.1,
+                key=f"{stat_col}_leader_price_range",
+            )
+
+        leader_col_c, leader_col_d = st.columns(2)
+        with leader_col_c:
+            if gw_max > gw_min:
+                leader_gw_range = st.slider(
+                    "Gameweek range", gw_min, gw_max, (gw_min, gw_max), key=f"{stat_col}_leader_gw_range"
+                )
+            else:
+                leader_gw_range = (gw_min, gw_max)
+        with leader_col_d:
+            leader_count = st.slider(
+                "Number of players", 3, 20, 10, key=f"{stat_col}_leader_count"
+            )
+
+        # Recompute totals from the raw per-GW rows within the selected
+        # gameweek range (rather than season-wide), so both the stat total
+        # and the per-90 rate reflect only that window.
+        gw_scoped_source = pivot_source[
+            (pivot_source["GW"] >= leader_gw_range[0]) & (pivot_source["GW"] <= leader_gw_range[1])
+        ]
+        scoped_stat = gw_scoped_source.groupby("name")[stat_col].sum()
+        scoped_minutes = gw_scoped_source.groupby("name")["minutes"].sum()
+        scoped_actual = gw_scoped_source.groupby("name")[actual_col].sum()
+        for s in (scoped_stat, scoped_minutes, scoped_actual):
+            s.index = s.index.map(lambda n: name_to_display.get(n, n))
+
+        leaders_pool = full_result[["position", "team", "price"]].copy()
+        leaders_pool["Total"] = scoped_stat
+        leaders_pool["MinutesTotal"] = scoped_minutes
+        leaders_pool["Actual"] = scoped_actual
+        leaders_pool[["Total", "MinutesTotal", "Actual"]] = leaders_pool[
+            ["Total", "MinutesTotal", "Actual"]
+        ].fillna(0)
+
+        if leader_position != "All":
+            leaders_pool = leaders_pool[leaders_pool["position"] == leader_position]
+        leaders_pool = leaders_pool[
+            (leaders_pool["price"] >= leader_price_range[0]) & (leaders_pool["price"] <= leader_price_range[1])
+        ]
+
+        nineties = (leaders_pool["MinutesTotal"] / 90).replace(0, float("nan"))
+        leaders_pool["Per90"] = (leaders_pool["Total"] / nineties).fillna(0).round(2)
+        leaders_pool["PlusMinus"] = (leaders_pool["Actual"] - leaders_pool["Total"]).round(2)
+
+        # Price/GW descriptors, collapsing to "Over £x" / "Under £x" when a
+        # bound is left at the slider's edge. Only fed into the title when
+        # that particular filter is actually narrowed from its default.
+        at_min = leader_price_range[0] <= price_min
+        at_max = leader_price_range[1] >= price_max
+        if at_max:
+            price_desc = f"Over £{leader_price_range[0]:.1f}"
+        elif at_min:
+            price_desc = f"Under £{leader_price_range[1]:.1f}"
+        else:
+            price_desc = f"£{leader_price_range[0]:.1f}-{leader_price_range[1]:.1f}"
+
+        if leader_gw_range[0] == leader_gw_range[1]:
+            gw_desc = f"GW{leader_gw_range[0]}"
+        else:
+            gw_desc = f"GW{leader_gw_range[0]}-{leader_gw_range[1]}"
+
+        active_filters = []
+        if leader_position != "All":
+            active_filters.append(leader_position)
+        if not (at_min and at_max):
+            active_filters.append(price_desc)
+        if leader_gw_range != (gw_min, gw_max):
+            active_filters.append(gw_desc)
+        filter_suffix = f" ({', '.join(active_filters)})" if active_filters else ""
+
+        title = f"{stat_short} Leaders{filter_suffix}"
+
+        top_leaders = leaders_pool.sort_values("Total", ascending=False).head(leader_count)
+        display_leaders = top_leaders.reset_index()[["name", "team", "price", "Total", "Per90"]]
+        display_leaders = display_leaders.rename(columns={
+            "name": "Player", "team": "Team", "price": "Price",
+            "Total": stat_short, "Per90": f"{stat_short} per 90",
+        })
+        st.caption(title)
+        st.dataframe(display_leaders, use_container_width=True)
+
+        lines = [f"*🎯 {title}*", ""]
+        for _, row in display_leaders.iterrows():
+            lines.append(f"{row['Player']} ({row['Team']}): {row[stat_short]:.2f} {stat_short}")
+        st.code("\n".join(lines), language=None)
+
+        # --- xG / xA Over/Under Performers ---
+        st.divider()
+        st.subheader(f"{stat_short} Over/Under Performers")
+
+        diff_col = f"{actual_label}-{stat_short} (+/-)"
+        over_under_table = leaders_pool.reset_index()[["name", "team", "price", "Total", "Actual", "PlusMinus"]]
+        over_under_table = over_under_table.rename(columns={
+            "name": "Player", "team": "Team", "price": "Price",
+            "Total": stat_short, "Actual": actual_label, "PlusMinus": diff_col,
+        })
+        over_under_table = over_under_table.sort_values(diff_col, ascending=False)
+
+        over_under_title = f"{stat_short} Over/Under Performers{filter_suffix}"
+        st.caption(over_under_title)
+        st.dataframe(over_under_table, use_container_width=True)
+
+        top_over = over_under_table.head(5)
+        top_under = over_under_table.tail(5).sort_values(diff_col)
+
+        def format_diff_line(row):
+            diff = row[diff_col]
+            sign = "+" if diff >= 0 else ""
+            return f"{row['Player']} ({row['Team']}): {row[actual_label]:.0f}{actual_label} from {row[stat_short]:.2f}{stat_short} ({sign}{diff:.2f})"
+
+        lines2 = [f"*📈 {stat_short} Overperformers{filter_suffix}*", ""]
+        for _, row in top_over.iterrows():
+            lines2.append(format_diff_line(row))
+        lines2.append("")
+        lines2.append(f"*📉 {stat_short} Underperformers{filter_suffix}*")
+        lines2.append("")
+        for _, row in top_under.iterrows():
+            lines2.append(format_diff_line(row))
+        st.code("\n".join(lines2), language=None)
 
 
 def render_team_stats():
@@ -461,6 +678,87 @@ def render_team_stats():
 
     st.caption(f"Showing **{stat_label}** per gameweek · {len(pivot)} teams")
     st.dataframe(pivot, use_container_width=True, height=700)
+
+    # --- Goals vs xG / Goals Conceded vs xGA over-under table ---
+    if stat_label in ("xG", "xGA"):
+        is_xg_team = stat_label == "xG"
+        actual_col_team = "goals_scored" if is_xg_team else "goals_conceded"
+        actual_agg_team = "sum" if is_xg_team else "max"
+        expected_col_team = "expected_goals" if is_xg_team else "expected_goals_conceded"
+        expected_agg_team = "sum" if is_xg_team else "max"
+        actual_label_team = "Goals" if is_xg_team else "Goals Conceded"
+        expected_label_team = "xG" if is_xg_team else "xGA"
+        diff_label_team = "G-xG (+/-)" if is_xg_team else "GC-xGA (+/-)"
+
+        st.divider()
+        st.subheader(f"{actual_label_team} vs {expected_label_team} (Over/Under Performance)")
+
+        available_gws_team = sorted(int(c[2:]) for c in gw_cols)
+        team_gw_min, team_gw_max = min(available_gws_team), max(available_gws_team)
+        if team_gw_max > team_gw_min:
+            team_gw_range = st.slider(
+                "Gameweek range", team_gw_min, team_gw_max, (team_gw_min, team_gw_max),
+                key=f"{stat_col}_team_ou_gw_range",
+            )
+        else:
+            team_gw_range = (team_gw_min, team_gw_max)
+
+        gw_scoped_view = view_df[(view_df["GW"] >= team_gw_range[0]) & (view_df["GW"] <= team_gw_range[1])]
+
+        actual_pivot = gw_scoped_view.pivot_table(
+            index="team_name", columns="GW", values=actual_col_team, aggfunc=actual_agg_team, fill_value=0
+        )
+        expected_pivot = gw_scoped_view.pivot_table(
+            index="team_name", columns="GW", values=expected_col_team, aggfunc=expected_agg_team, fill_value=0
+        )
+        actual_total = actual_pivot.sum(axis=1)
+        expected_total = expected_pivot.sum(axis=1)
+        diff_total = (actual_total - expected_total).round(2)
+
+        over_under = pd.DataFrame({
+            actual_label_team: actual_total.astype(int),
+            expected_label_team: expected_total.round(2),
+            diff_label_team: diff_total,
+        })
+        over_under = over_under.reset_index().rename(columns={"team_name": "Team"})
+
+        if is_xg_team:
+            over_under = over_under.sort_values(diff_label_team, ascending=False)
+            st.caption("Positive = scoring more than expected. Negative = underperforming their chances.")
+        else:
+            over_under = over_under.sort_values(diff_label_team, ascending=True)
+            st.caption("Negative = conceding fewer goals than expected (defense outperforming). Positive = conceding more than expected.")
+        over_under.index = range(1, len(over_under) + 1)
+        st.dataframe(over_under, use_container_width=True)
+
+        # --- Text box: top over/under achievers for the selected GW range ---
+        if team_gw_range == (team_gw_min, team_gw_max):
+            team_gw_desc = ""
+        elif team_gw_range[0] == team_gw_range[1]:
+            team_gw_desc = f" (GW{team_gw_range[0]})"
+        else:
+            team_gw_desc = f" (GW{team_gw_range[0]}-{team_gw_range[1]})"
+
+        over_ranked = over_under.sort_values(diff_label_team, ascending=False)
+        top_over_teams = over_ranked.head(5)
+        top_under_teams = over_ranked.tail(5).sort_values(diff_label_team)
+
+        def format_team_diff_line(row):
+            diff = row[diff_label_team]
+            sign = "+" if diff >= 0 else ""
+            return f"{row['Team']}: {row[actual_label_team]:.0f}{'G' if is_xg_team else 'GC'} from {row[expected_label_team]:.2f}{expected_label_team} ({sign}{diff:.2f})"
+
+        team_lines = [f"*📈 {expected_label_team} Overperformers{team_gw_desc}*", ""]
+        for _, row in top_over_teams.iterrows():
+            team_lines.append(format_team_diff_line(row))
+        team_lines.append("")
+        team_lines.append(f"*📉 {expected_label_team} Underperformers{team_gw_desc}*")
+        team_lines.append("")
+        for _, row in top_under_teams.iterrows():
+            team_lines.append(format_team_diff_line(row))
+        st.code("\n".join(team_lines), language=None)
+
+
 
     # Cumulative running-total chart, growing gameweek by gameweek
     chart_teams = selected_teams if selected_teams else pivot.sort_values("Total", ascending=False)["Team"].head(8).tolist()
@@ -534,8 +832,8 @@ def render_compare():
         col = STAT_OPTIONS[label]
         raw_totals = player_df.groupby("name")[col].sum()
         if per_90 and label != "Minutes":
-            nineties = (minutes_by_player / 90).replace(0, pd.NA)
-            totals[label] = (raw_totals / nineties).round(2).fillna(0)
+            nineties = (minutes_by_player / 90).replace(0, float("nan"))
+            totals[label] = (raw_totals / nineties).fillna(0).round(2)
         else:
             totals[label] = raw_totals
     totals_df = pd.DataFrame(totals).T
@@ -553,7 +851,7 @@ def render_compare():
         chart_minutes_pivot = player_df.pivot_table(
             index="GW", columns="name", values="minutes", aggfunc="sum", fill_value=0
         )
-        nineties_pivot = (chart_minutes_pivot / 90).replace(0, pd.NA)
+        nineties_pivot = (chart_minutes_pivot / 90).replace(0, float("nan"))
         chart_data = (chart_stat_pivot / nineties_pivot).fillna(0)
     else:
         chart_data = chart_stat_pivot
